@@ -1,7 +1,10 @@
 /class
 /__pycache__
 .env
-/skills
+# 1. Ignore the contents of the skills folder
+/skills/*
+
+# 2. But DO NOT ignore these specific files
 !/skills/cmd.py
 !/skills/skill_creator.py
 !/skills/skill_reader.py
