@@ -1,0 +1,7 @@
+/class
+/__pycache__
+.env
+/skills
+!/skills/cmd.py
+!/skills/skill_creator.py
+!/skills/skill_reader.py
