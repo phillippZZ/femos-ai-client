@@ -5,3 +5,4 @@
 !/skills/cmd.py
 !/skills/skill_creator.py
 !/skills/skill_reader.py
+.DS_Store
