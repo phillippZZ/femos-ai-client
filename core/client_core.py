@@ -22,7 +22,7 @@ Methods:
 """
 
 import threading
-from core.config import SERVER_URL
+from core.config import SERVER_URL, CLIENT_ID, HISTORY_PATH
 from core.transcribe import Recorder
 from core.tools import (SKILLS as CLIENT_SKILLS, TOOLS_CONFIG as CLIENT_TOOLS_CONFIG,
                         reload_skills, set_reregister_callback)
@@ -44,7 +44,8 @@ class ClientCore:
         self.on_transcribed: callable = lambda text: None
 
         # ── WebSocket client ─────────────────────────────────────────
-        self._ws = WsClient(SERVER_URL, CLIENT_SKILLS, CLIENT_TOOLS_CONFIG, reload_skills)
+        self._ws = WsClient(SERVER_URL, CLIENT_SKILLS, CLIENT_TOOLS_CONFIG,
+                            reload_skills, client_id=CLIENT_ID, history_path=HISTORY_PATH)
         self._ws.on_status    = lambda t: self.on_status(t)
         self._ws.on_result    = lambda t: self.on_result(t)
         self._ws.on_error     = lambda t: self.on_error(t)
@@ -69,6 +70,14 @@ class ClientCore:
 
     def new_chat(self):
         self._ws.clear_history()
+
+    def interrupt(self):
+        """Stop the current agent run immediately."""
+        self._ws.interrupt()
+
+    def steer(self, text: str):
+        """Inject a steering message into the running agent."""
+        self._ws.steer(text)
 
     # ── Microphone ────────────────────────────────────────────────────
     def start_recording(self):
