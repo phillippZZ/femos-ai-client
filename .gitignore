@@ -1,5 +1,5 @@
 /class
-/__pycache__
+**/__pycache__/
 .env
 # 1. Ignore the contents of the skills folder
 /skills/*
