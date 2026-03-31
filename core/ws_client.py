@@ -49,6 +49,7 @@ import threading
 import websockets
 
 from core.tools import reload_skills as _reload_skills, TOOLS_CONFIG as _TOOLS_CONFIG
+from core import skill_runtime as _skill_runtime
 
 logger = logging.getLogger("femos.client")
 
@@ -76,17 +77,33 @@ def _build_workspace_tasks_snapshot() -> list:
         try:
             with open(ctx_path) as _f:
                 ctx = _json.load(_f)
-            if ctx.get("status") == "completed":
+            status = ctx.get("status", "")
+            artifacts = ctx.get("artifacts") or {}
+            # Always include non-completed tasks.
+            # Also include completed tasks that have artifacts, so the stale
+            # detector can catch broken skills after version updates etc.
+            if status == "completed" and not artifacts:
                 continue
+            # Flag tasks where current_step > 0 but artifacts don't fully cover
+            # the completed steps. This means the task advanced without recording
+            # what it built — verification is needed before continuing.
+            needs_verification = (
+                status != "completed"
+                and ctx.get("current_step", 0) > 0
+                and len(artifacts) < ctx.get("current_step", 0)
+            )
             summaries.append({
                 "task_id": task_id,
                 "title": ctx.get("title", ""),
-                "status": ctx.get("status", ""),
+                "status": status,
                 "current_step": ctx.get("current_step", 0),
                 "total_steps": len(ctx.get("plan_steps", [])),
                 "plan_steps": ctx.get("plan_steps", []),
                 "notes": ctx.get("notes", ""),
                 "module_path": ctx.get("module_path", ""),
+                "artifacts": artifacts,
+                "docs": ctx.get("docs", ""),
+                "needs_verification": needs_verification,
             })
         except Exception:
             pass
@@ -122,6 +139,20 @@ class WsClient:
         self.on_queue_full: callable = lambda msg: None
         # on_tool_call: override if the UI wants to intercept before exec
         self.on_tool_call: callable = None  # defaults to self._exec_tool
+
+        # Buffer of recent background skill events — injected into the next user
+        # message so the AI has context when the user reacts to a notification.
+        self._skill_event_buffer: list = []   # list of str summaries
+        self._skill_event_lock = threading.Lock()
+
+        # Wire skill_runtime so all skills (one-shot and persistent) can emit events.
+        # Done once here; safe to call multiple times — _set_sender is idempotent.
+        # Use lambdas that close over `self` so they always call the *current*
+        # on_task_log/send callbacks even if the UI replaces them after startup.
+        _skill_runtime._set_sender(
+            send_fn=lambda payload: self._on_skill_emit(payload),
+            log_fn=lambda tid, lvl, txt, ts: self.on_task_log(tid, lvl, txt, ts),
+        )
 
     def start(self):
         """Start the WebSocket loop in a background daemon thread."""
@@ -226,6 +257,22 @@ class WsClient:
             self.on_task_failed(task_id, msg.get("error", ""))
         elif t == "queue_full":
             self.on_queue_full(msg)
+        # ── Skill events echoed back from server ───────────────────────────
+        elif t == "skill_event":
+            # The server echoes skill_event messages back as task_log so the UI
+            # automatically captures them the same way it captures task progress.
+            level = "error" if msg.get("event") == "error" else "info"
+            skill = msg.get("skill", "?")
+            event = msg.get("event", "event")
+            data  = msg.get("data", "")
+            ts    = msg.get("ts", 0)
+            self.on_task_log(task_id, level, f"[{skill}:{event}] {data}", ts)
+            # Also buffer server-echoed skill events so the next user message
+            # carries them as context (in case the user is reacting to them).
+            import time as _time
+            summary = f"[{skill}:{event}] {data}"
+            with self._skill_event_lock:
+                self._skill_event_buffer.append(summary)
 
     def _exec_tool_threaded(self, msg: dict):
         threading.Thread(target=self._exec_tool, args=(msg,), daemon=True).start()
@@ -264,8 +311,36 @@ class WsClient:
                 self._ws.send(json.dumps(payload)), self._loop
             )
 
+    def _on_skill_emit(self, payload: dict):
+        """Called by skill_runtime.emit() for every local skill event.
+        Buffers the event summary and forwards to the server."""
+        skill = payload.get("skill", "?")
+        event = payload.get("event", "event")
+        data  = payload.get("data", "")
+        summary = f"[{skill}:{event}] {data}"
+        with self._skill_event_lock:
+            self._skill_event_buffer.append(summary)
+        self.send(payload)
+
+    def _pop_skill_context(self) -> str:
+        """Drain the skill event buffer and return a formatted context block,
+        or empty string if nothing has accumulated since the last user message."""
+        with self._skill_event_lock:
+            if not self._skill_event_buffer:
+                return ""
+            lines = list(self._skill_event_buffer)
+            self._skill_event_buffer.clear()
+        header = (
+            f"[Background skill events since your last message ({len(lines)} event(s))]\n"
+            + "\n".join(f"  • {l}" for l in lines[-20:])   # cap at 20 most recent
+            + "\n"
+        )
+        return header
+
     def send_message(self, text: str):
-        self.send({"type": "message", "text": text})
+        prefix = self._pop_skill_context()
+        full_text = prefix + text if prefix else text
+        self.send({"type": "message", "text": full_text})
 
     def steer(self, text: str, task_id: str = ""):
         """Inject a steering message, optionally targeting a specific task."""

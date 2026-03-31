@@ -11,7 +11,8 @@ Directory layout (under TASKS_DIR = ~/.femos/tasks/):
 
 Three skills are exposed to the LLM:
     task_init    — create or overwrite a task context (call at the start of any complex task)
-    task_update  — update fields: status, current_step, module_path, usage, notes, add sub-task
+    task_update  — update fields: status, current_step, module_path, usage, notes, docs,
+                   artifacts (per-step artifact registry), add/remove sub-task, replace plan
     task_read    — read a task context (or list all tasks if no task_id given)
 
 These are registered via SKILL_FNS / SKILL_DEFS (plural) so the builtin loader
@@ -100,6 +101,8 @@ def task_init(task_id: str, title: str, plan_steps: list,
         "module_path": None,     # path to created skill file (if any)
         "usage": None,           # how to call the resulting skill
         "notes": "",
+        "docs": "",              # user-facing documentation / user manual (markdown)
+        "artifacts": {},         # {"step_index": ["skill_name_or_filepath", ...]} — what was created per step
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
     }
@@ -117,6 +120,7 @@ def task_init(task_id: str, title: str, plan_steps: list,
 
 def task_update(task_id: str, status: str = "", current_step: int = -1,
                 module_path: str = "", usage: str = "", notes: str = "",
+                set_docs: str = "", set_artifacts: dict = None,
                 add_subtask_id: str = "", add_subtask_title: str = "",
                 remove_subtask_id: str = "",
                 replace_plan_steps: list = None) -> str:
@@ -125,8 +129,10 @@ def task_update(task_id: str, status: str = "", current_step: int = -1,
 
     Call this when:
     - A step is completed: set current_step to the next step index.
+    - A skill was created and validated: set set_artifacts={step_index: ["skill_name"]}.
     - A skill file was created: set module_path and usage.
     - The task finishes: set status to 'completed' or 'failed'.
+    - Writing user docs: set set_docs to a markdown string describing the created system.
     - A sub-task was started: provide add_subtask_id + add_subtask_title.
     - A sub-task is no longer needed: provide remove_subtask_id.
     - The plan needs revision: provide replace_plan_steps with the new list.
@@ -154,6 +160,15 @@ def task_update(task_id: str, status: str = "", current_step: int = -1,
         if notes:
             ctx["notes"] = notes
             changed.append(f"notes updated")
+        if set_docs:
+            ctx["docs"] = set_docs
+            changed.append("docs updated")
+        if set_artifacts is not None:
+            if not isinstance(ctx.get("artifacts"), dict):
+                ctx["artifacts"] = {}
+            for k, v in set_artifacts.items():
+                ctx["artifacts"][str(k)] = list(v) if isinstance(v, list) else [str(v)]
+            changed.append("artifacts updated")
         if add_subtask_id and add_subtask_title:
             ctx["subtasks"].append({
                 "task_id": add_subtask_id,
@@ -325,6 +340,28 @@ SKILL_DEFS = [
                         "description": (
                             "Overwrite the entire plan_steps list with this new ordered list. "
                             "Use when the approach has changed and the old plan no longer applies."
+                        ),
+                    },
+                    "set_artifacts": {
+                        "type": "object",
+                        "description": (
+                            "Record artifacts created in a specific step. "
+                            "Keys are step indices (as strings, 1-based), values are lists of identifiers: "
+                            "skill names for registered skills, or relative file paths. "
+                            "Example: {\"1\": [\"transaction_manager\"]} means step 1 created the transaction_manager skill. "
+                            "These are used to detect stale completed steps when resuming a task after a restart."
+                        ),
+                        "additionalProperties": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "set_docs": {
+                        "type": "string",
+                        "description": (
+                            "Write or update user-facing documentation for this task: "
+                            "what the created skill/system does, how to use it, parameters, examples. "
+                            "This is the user manual. Supports markdown."
                         ),
                     },
                 },
