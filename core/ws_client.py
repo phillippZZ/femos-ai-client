@@ -1,18 +1,42 @@
 """
-ui/ws_client.py
+core/ws_client.py
 
 Platform-agnostic WebSocket client core.
 Handles connection, reconnection, skill registration, event dispatch, and tool execution.
 
+New event types handled (server → client):
+    task_started  — {task_id, title}
+    task_log      — {task_id, level, text, ts}  (real-time progress)
+    task_completed — {task_id}
+    task_failed   — {task_id, error}
+    queue_full    — {active, limit, active_ids, message}
+
+New methods (client → server):
+    cancel_task(task_id)
+    replace_task(task_id_or_empty, new_text)
+
+Callbacks added:
+    on_task_started(task_id, title)
+    on_task_log(task_id, level, text, ts)
+    on_task_completed(task_id)
+    on_task_failed(task_id, error)
+    on_queue_full(msg: dict)
+
 Usage by any UI:
     client = WsClient(server_url, skills, tools_config, reload_skills_fn)
-    client.on_status    = fn(text: str)
-    client.on_result    = fn(text: str)
-    client.on_error     = fn(text: str)
-    client.on_tool_call = fn(msg: dict)   # override only if you want custom dispatch
-    client.on_connected = fn(connected: bool)
-    client.start()          # begins asyncio loop in background thread
+    client.on_status        = fn(text: str)
+    client.on_result        = fn(task_id: str, text: str)
+    client.on_error         = fn(text: str)
+    client.on_task_started  = fn(task_id: str, title: str)
+    client.on_task_log      = fn(task_id: str, level: str, text: str, ts: int)
+    client.on_task_completed = fn(task_id: str)
+    client.on_task_failed   = fn(task_id: str, error: str)
+    client.on_queue_full    = fn(msg: dict)
+    client.on_connected     = fn(connected: bool)
+    client.start()
     client.send_message(text)
+    client.cancel_task(task_id)
+    client.replace_task(task_id, new_text)
     client.clear_history()
 """
 
@@ -45,10 +69,16 @@ class WsClient:
 
         # ── Callbacks (set by the UI layer) ──────────────────────────
         self.on_status: callable = lambda text: None
-        self.on_result: callable = lambda text: None
+        self.on_result: callable = lambda task_id, text: None
         self.on_error: callable = lambda text: None
         self.on_thinking: callable = lambda text: None
         self.on_connected: callable = lambda connected: None
+        # Task lifecycle callbacks
+        self.on_task_started: callable = lambda task_id, title: None
+        self.on_task_log: callable = lambda task_id, level, text, ts: None
+        self.on_task_completed: callable = lambda task_id: None
+        self.on_task_failed: callable = lambda task_id, error: None
+        self.on_queue_full: callable = lambda msg: None
         # on_tool_call: override if the UI wants to intercept before exec
         self.on_tool_call: callable = None  # defaults to self._exec_tool
 
@@ -123,12 +153,13 @@ class WsClient:
 
     def _dispatch(self, msg: dict):
         t = msg.get("type")
+        task_id = msg.get("task_id", "")
         if t == "status":
             self.on_status(msg.get("text", ""))
         elif t == "thinking":
             self.on_thinking(msg.get("text", ""))
         elif t == "result":
-            self.on_result(msg.get("text", ""))
+            self.on_result(task_id, msg.get("text", ""))
         elif t == "error":
             self.on_error(msg.get("text", ""))
         elif t == "session_resumed":
@@ -141,6 +172,18 @@ class WsClient:
         elif t == "tool_call":
             handler = self.on_tool_call or self._exec_tool_threaded
             handler(msg)
+        # ── Task lifecycle ───────────────────────────────────────────
+        elif t == "task_started":
+            self.on_task_started(task_id, msg.get("title", ""))
+        elif t == "task_log":
+            self.on_task_log(task_id, msg.get("level", "info"),
+                             msg.get("text", ""), msg.get("ts", 0))
+        elif t == "task_completed":
+            self.on_task_completed(task_id)
+        elif t == "task_failed":
+            self.on_task_failed(task_id, msg.get("error", ""))
+        elif t == "queue_full":
+            self.on_queue_full(msg)
 
     def _exec_tool_threaded(self, msg: dict):
         threading.Thread(target=self._exec_tool, args=(msg,), daemon=True).start()
@@ -182,13 +225,27 @@ class WsClient:
     def send_message(self, text: str):
         self.send({"type": "message", "text": text})
 
-    def steer(self, text: str):
-        """Inject a steering message into the currently running agent."""
-        self.send({"type": "steer", "text": text})
+    def steer(self, text: str, task_id: str = ""):
+        """Inject a steering message, optionally targeting a specific task."""
+        payload = {"type": "steer", "text": text}
+        if task_id:
+            payload["task_id"] = task_id
+        self.send(payload)
 
-    def interrupt(self):
-        """Tell the server to stop the current agent run immediately."""
-        self.send({"type": "interrupt"})
+    def interrupt(self, task_id: str = ""):
+        """Stop a specific task (or all tasks if no task_id given)."""
+        payload = {"type": "interrupt"}
+        if task_id:
+            payload["task_id"] = task_id
+        self.send(payload)
+
+    def cancel_task(self, task_id: str):
+        """Request the server to cancel a running task."""
+        self.send({"type": "cancel_task", "task_id": task_id})
+
+    def replace_task(self, task_id: str, new_text: str):
+        """Cancel task_id (or oldest if empty) and immediately start new_text."""
+        self.send({"type": "replace_task", "task_id": task_id, "text": new_text})
 
     def clear_history(self):
         self.clear_local_history()

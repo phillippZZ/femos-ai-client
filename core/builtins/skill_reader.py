@@ -1,14 +1,16 @@
 import os
 
-_SKILLS_DIR = os.path.dirname(__file__)
+from core.config import SKILLS_DIR
+
 
 def read_skill(name):
-    """Return the source code of an existing client-side skill file."""
-    path = os.path.join(_SKILLS_DIR, f"{name}.py")
+    """Return the source code of an existing user skill file."""
+    path = os.path.join(SKILLS_DIR, f"{name}.py")
     if not os.path.exists(path):
         return f"Error: skill '{name}' not found."
     with open(path, "r") as f:
         return f.read()
+
 
 SKILL_FN = read_skill
 SKILL_DEF = {

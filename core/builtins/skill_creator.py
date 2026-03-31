@@ -1,14 +1,18 @@
 import os
+import importlib
+import sys
 import py_compile
 import tempfile
 import threading
 
-_SKILLS_DIR = os.path.dirname(__file__)
+from core.config import SKILLS_DIR
+
 _lock = threading.Lock()
+
 
 def create_skill(name, code, overwrite=False):
     """
-    Write a new skill Python file to the client skills/ directory and hot-reload.
+    Write a new skill Python file to the user skills/ directory and hot-reload.
 
     The code must define:
       - A callable function (the skill implementation)
@@ -34,7 +38,7 @@ def create_skill(name, code, overwrite=False):
             os.remove(tmp_path)
 
     with _lock:
-        path = os.path.join(_SKILLS_DIR, f"{name}.py")
+        path = os.path.join(SKILLS_DIR, f"{name}.py")
         if os.path.exists(path) and not overwrite:
             return f"Error: skill '{name}' already exists. Pass overwrite=true to replace it."
         try:
@@ -42,6 +46,29 @@ def create_skill(name, code, overwrite=False):
                 f.write(code)
             from core.tools import reload_skills
             reload_skills()
+            # Inspect the module to find the actual registered skill name(s).
+            # The callable name comes from SKILL_DEF["function"]["name"], NOT the file name.
+            registered = []
+            try:
+                full_name = f"skills.{name}"
+                if full_name in sys.modules:
+                    mod = importlib.reload(sys.modules[full_name])
+                else:
+                    mod = importlib.import_module(full_name)
+                if hasattr(mod, "SKILL_FNS") and hasattr(mod, "SKILL_DEFS"):
+                    for defn in mod.SKILL_DEFS:
+                        registered.append(defn["function"]["name"])
+                elif hasattr(mod, "SKILL_FN") and hasattr(mod, "SKILL_DEF"):
+                    registered.append(mod.SKILL_DEF["function"]["name"])
+            except Exception:
+                pass
+            if registered:
+                names_str = ", ".join(f"'{n}'" for n in registered)
+                return (
+                    f"Skill '{name}' created and loaded successfully. "
+                    f"Registered callable name(s): {names_str}. "
+                    f"Use these exact names when calling the skill."
+                )
             return f"Skill '{name}' created and loaded successfully."
         except Exception as e:
             if os.path.exists(path):
