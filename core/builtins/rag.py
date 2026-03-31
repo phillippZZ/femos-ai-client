@@ -43,11 +43,20 @@ def _ollama_base() -> str:
         return os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 
 
-INDEXES_DIR   = os.path.expanduser("~/.femos/indexes")
+INDEXES_DIR   = None   # resolved lazily from config (see _indexes_dir())
 DEFAULT_MODEL = os.getenv("RAG_EMBED_MODEL", "nomic-embed-text")
 CHUNK_LINES   = int(os.getenv("RAG_CHUNK_LINES", "60"))
 OVERLAP_LINES = int(os.getenv("RAG_OVERLAP_LINES", "10"))
 MAX_CHUNK_CHARS = 4000     # hard cap so one chunk never dominates the prompt
+
+
+def _indexes_dir() -> str:
+    """Return the indexes directory, preferring the workspace-relative path from config."""
+    try:
+        from core.config import INDEXES_DIR as _cfg_dir
+        return _cfg_dir
+    except ImportError:
+        return os.path.expanduser("~/.femos/indexes")
 
 
 # ── Embedding ─────────────────────────────────────────────────────────────────
@@ -152,7 +161,7 @@ def _chunk_file(filepath: str) -> list:
 # ── Index path helpers ────────────────────────────────────────────────────────
 
 def _index_dir(name: str) -> str:
-    return os.path.join(INDEXES_DIR, name)
+    return os.path.join(_indexes_dir(), name)
 
 
 def _load_index(name: str):
@@ -319,17 +328,18 @@ def rag_search(
 
 def rag_list() -> str:
     """List all available RAG indexes with their metadata."""
-    if not os.path.exists(INDEXES_DIR):
+    idx_root = _indexes_dir()
+    if not os.path.exists(idx_root):
         return "No indexes found. Run rag_index to create one."
     names = [
-        d for d in os.listdir(INDEXES_DIR)
-        if os.path.isdir(os.path.join(INDEXES_DIR, d))
+        d for d in os.listdir(idx_root)
+        if os.path.isdir(os.path.join(idx_root, d))
     ]
     if not names:
         return "No indexes found. Run rag_index to create one."
     lines = ["Available RAG indexes:"]
     for n in sorted(names):
-        meta_path = os.path.join(INDEXES_DIR, n, "meta.json")
+        meta_path = os.path.join(idx_root, n, "meta.json")
         if os.path.exists(meta_path):
             m = json.loads(open(meta_path).read())
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(m.get("created", 0)))

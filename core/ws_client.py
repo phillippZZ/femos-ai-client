@@ -53,6 +53,47 @@ from core.tools import reload_skills as _reload_skills, TOOLS_CONFIG as _TOOLS_C
 logger = logging.getLogger("femos.client")
 
 
+def _build_workspace_tasks_snapshot() -> list:
+    """
+    Read workspace/tasks/ and return compact summaries of in-progress task contexts.
+    Sent to the server in every register_skills message so the orchestrator can
+    inject knowledge of unfinished work into the prompt without a tool call.
+    """
+    import json as _json
+    try:
+        from core.config import TASKS_DIR
+    except ImportError:
+        return []
+    if not os.path.isdir(TASKS_DIR):
+        return []
+    summaries = []
+    for task_id in os.listdir(TASKS_DIR):
+        if not os.path.isdir(os.path.join(TASKS_DIR, task_id)):
+            continue
+        ctx_path = os.path.join(TASKS_DIR, task_id, "context.json")
+        if not os.path.exists(ctx_path):
+            continue
+        try:
+            with open(ctx_path) as _f:
+                ctx = _json.load(_f)
+            if ctx.get("status") == "completed":
+                continue
+            summaries.append({
+                "task_id": task_id,
+                "title": ctx.get("title", ""),
+                "status": ctx.get("status", ""),
+                "current_step": ctx.get("current_step", 0),
+                "total_steps": len(ctx.get("plan_steps", [])),
+                "plan_steps": ctx.get("plan_steps", []),
+                "notes": ctx.get("notes", ""),
+                "module_path": ctx.get("module_path", ""),
+            })
+        except Exception:
+            pass
+    return summaries
+
+
+
 class WsClient:
     def __init__(self, server_url: str, skills: dict, tools_config: list,
                  reload_fn=None, client_id: str = "", history_path: str = ""):
@@ -138,6 +179,7 @@ class WsClient:
                     await ws.send(json.dumps({
                         "type": "register_skills",
                         "skills": self.tools_config,
+                        "workspace_tasks": _build_workspace_tasks_snapshot(),
                     }))
                     async for raw in ws:
                         try:
@@ -252,4 +294,8 @@ class WsClient:
         self.send({"type": "clear_history"})
 
     def reregister_skills(self):
-        self.send({"type": "register_skills", "skills": self.tools_config})
+        self.send({
+            "type": "register_skills",
+            "skills": self.tools_config,
+            "workspace_tasks": _build_workspace_tasks_snapshot(),
+        })

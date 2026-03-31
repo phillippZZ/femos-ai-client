@@ -40,8 +40,17 @@ HISTORY_PATH: str = os.path.expanduser(f"~/.femos_history_{CLIENT_ID}.json")
 # Directory where user-created skills live (hot-reloaded at runtime).
 # core/config.py lives at  femos-ai-client/core/config.py
 # so dirname(dirname(__file__)) == femos-ai-client/
-SKILLS_DIR: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills")
+_CLIENT_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SKILLS_DIR: str = os.path.join(_CLIENT_DIR, "skills")
+
+# Workspace directory — all agent-generated artefacts live here so they are
+# visible in the project file tree alongside the skills they refer to.
+#   workspace/tasks/<task_id>/context.json + log.jsonl
+#   workspace/indexes/<name>/chunks.json + embeddings.npy + meta.json
+WORKSPACE_DIR: str = os.path.join(_CLIENT_DIR, "workspace")
 
 # Root directory for task context files and real-time logs.
-# Layout: TASKS_DIR/<task_id>/context.json  and  TASKS_DIR/<task_id>/log.jsonl
-TASKS_DIR: str = os.path.expanduser("~/.femos/tasks")
+TASKS_DIR: str = os.path.join(WORKSPACE_DIR, "tasks")
+
+# Root directory for RAG vector indexes.
+INDEXES_DIR: str = os.path.join(WORKSPACE_DIR, "indexes")

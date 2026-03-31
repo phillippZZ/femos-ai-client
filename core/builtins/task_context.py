@@ -117,7 +117,9 @@ def task_init(task_id: str, title: str, plan_steps: list,
 
 def task_update(task_id: str, status: str = "", current_step: int = -1,
                 module_path: str = "", usage: str = "", notes: str = "",
-                add_subtask_id: str = "", add_subtask_title: str = "") -> str:
+                add_subtask_id: str = "", add_subtask_title: str = "",
+                remove_subtask_id: str = "",
+                replace_plan_steps: list = None) -> str:
     """
     Update fields in an existing task context.
 
@@ -126,8 +128,10 @@ def task_update(task_id: str, status: str = "", current_step: int = -1,
     - A skill file was created: set module_path and usage.
     - The task finishes: set status to 'completed' or 'failed'.
     - A sub-task was started: provide add_subtask_id + add_subtask_title.
+    - A sub-task is no longer needed: provide remove_subtask_id.
+    - The plan needs revision: provide replace_plan_steps with the new list.
 
-    Omit (leave blank) any field you do not want to change.
+    Omit (leave blank / None) any field you do not want to change.
     """
     with _lock:
         ctx = _read_context(task_id)
@@ -163,6 +167,19 @@ def task_update(task_id: str, status: str = "", current_step: int = -1,
                 if st["task_id"] == add_subtask_id:
                     st["status"] = status or "completed"
                     changed.append(f"subtask {add_subtask_id} marked {st['status']}")
+        if remove_subtask_id:
+            before = len(ctx["subtasks"])
+            ctx["subtasks"] = [st for st in ctx["subtasks"] if st["task_id"] != remove_subtask_id]
+            if len(ctx["subtasks"]) < before:
+                changed.append(f"subtask {remove_subtask_id} removed")
+            else:
+                changed.append(f"subtask {remove_subtask_id} not found (no change)")
+        if replace_plan_steps is not None:
+            if not isinstance(replace_plan_steps, list) or not replace_plan_steps:
+                changed.append("replace_plan_steps ignored (must be non-empty list)")
+            else:
+                ctx["plan_steps"] = [str(s) for s in replace_plan_steps]
+                changed.append(f"plan_steps replaced ({len(ctx['plan_steps'])} steps)")
 
         ctx["updated_at"] = int(time.time())
         _write_context(task_id, ctx)
@@ -183,7 +200,8 @@ def task_read(task_id: str = "") -> str:
     if not task_id:
         if not os.path.isdir(TASKS_DIR):
             return "No tasks directory found — no tasks have been created yet."
-        entries = sorted(os.listdir(TASKS_DIR))
+        entries = sorted(e for e in os.listdir(TASKS_DIR)
+                         if os.path.isdir(os.path.join(TASKS_DIR, e)))
         tasks = []
         for name in entries:
             ctx = _read_context(name)
@@ -203,9 +221,32 @@ def task_read(task_id: str = "") -> str:
     return json.dumps(ctx, indent=2)
 
 
+# ── task_delete ──────────────────────────────────────────────────────────────
+
+import shutil as _shutil
+
+def task_delete(task_id: str) -> str:
+    """
+    Permanently delete a task context folder (context.json + log.jsonl).
+
+    Use when a task or sub-task is obsolete, was created by mistake, or has
+    been superseded. This cannot be undone.
+    """
+    if not task_id:
+        return "Error: task_id is required."
+    d = _task_dir(task_id)
+    if not os.path.isdir(d):
+        return f"Error: no task context found for '{task_id}'."
+    try:
+        _shutil.rmtree(d)
+        return f"Task '{task_id}' context deleted."
+    except Exception as e:
+        return f"Error deleting task '{task_id}': {e}"
+
+
 # ── Plural export (loaded by core/tools._load_builtins) ──────────────────────
 
-SKILL_FNS = [task_init, task_update, task_read]
+SKILL_FNS = [task_init, task_update, task_read, task_delete]
 
 SKILL_DEFS = [
     {
@@ -273,6 +314,39 @@ SKILL_DEFS = [
                     "add_subtask_title": {
                         "type": "string",
                         "description": "Title for the new sub-task (required when add_subtask_id is set).",
+                    },
+                    "remove_subtask_id": {
+                        "type": "string",
+                        "description": "task_id of a sub-task to remove from this task's subtask list.",
+                    },
+                    "replace_plan_steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Overwrite the entire plan_steps list with this new ordered list. "
+                            "Use when the approach has changed and the old plan no longer applies."
+                        ),
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_delete",
+            "description": (
+                "Permanently delete a task context folder. "
+                "Use when a task or sub-task is obsolete, was created by mistake, "
+                "or has been superseded. Cannot be undone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The task_id of the context to delete.",
                     },
                 },
                 "required": ["task_id"],

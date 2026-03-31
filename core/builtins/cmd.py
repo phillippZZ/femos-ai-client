@@ -8,15 +8,12 @@ def exec_cmd(command):
             shell=True,
             capture_output=True,
             text=True,
-            timeout=15
         )
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         if stdout and stderr:
             return f"{stdout}\n[stderr]: {stderr}"
         return stdout or stderr or "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Command timed out after 15 seconds."
     except Exception as e:
         return f"Error: {str(e)}"
 
