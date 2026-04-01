@@ -18,7 +18,7 @@ def ask_user(question: str, title: str = "AI Assistant", default: str = "") -> s
     print(f"  {question}", file=sys.stderr)
     if default:
         print(f"  (press Enter to accept default: {default!r})", file=sys.stderr)
-    width = max(len(title) + 8, 20)
+    width = max(len(title) + 8, 20)1
     print(f"╚{'═' * width}╝", file=sys.stderr)
     try:
         response = input("→ ").strip()
@@ -35,10 +35,12 @@ SKILL_DEF = {
         "name": "ask_user",
         "description": (
             "Pause execution and ask the user a question, blocking until they type an answer. "
-            "Use this whenever you need a value you cannot know or guess: API keys, "
+            "Use this ONLY when you genuinely need information you cannot know: API keys, "
             "secret tokens, OAuth credentials, account IDs, file paths, domain names, "
-            "configuration values, or confirmation before a destructive action. "
-            "NEVER hard-code or guess secrets — always call ask_user first. "
+            "or configuration values that cannot be inferred. "
+            "NEVER use ask_user to ask for permission or confirmation before routine actions "
+            "like creating skills, writing files, or running code — just do the task. "
+            "NEVER hard-code or guess secrets — call ask_user for those. "
             "Returns the user's typed answer as a plain string."
         ),
         "parameters": {

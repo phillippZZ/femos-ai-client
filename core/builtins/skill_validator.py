@@ -33,9 +33,11 @@ def validate_skill(name: str, test_args: dict = None,
     if test_args is None:
         test_args = {}
 
-    skill_path = os.path.join(SKILLS_DIR, f"{name}.py")
-    if not os.path.exists(skill_path):
-        return f"VALIDATION FAIL: skill file '{name}.py' not found in skills/."
+    skill_dir   = os.path.join(SKILLS_DIR, name)
+    skill_flat  = os.path.join(SKILLS_DIR, f"{name}.py")
+    skill_init  = os.path.join(skill_dir, "__init__.py")
+    if not os.path.isdir(skill_dir) and not os.path.isfile(skill_flat):
+        return f"VALIDATION FAIL: skill '{name}' not found in skills/ (checked skills/{name}/ and skills/{name}.py)."
 
     # Force re-import so we always test the freshly written version
     full_module = f"skills.{name}"

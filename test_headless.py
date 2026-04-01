@@ -261,7 +261,8 @@ def test_create_and_validate_skill(sess: HeadlessSession, client_skills: dict):
     import os
     skill_name = f"test_ping_{int(time.time())}"
     # __file__ is inside femos-ai-client/, so skills/ is a direct sibling
-    skill_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", f"{skill_name}.py")
+    skill_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", skill_name)
+    skill_file = os.path.join(skill_dir, "__init__.py")
 
     task_id = sess.send_message_with_tools(
         f"Create a skill named '{skill_name}' that takes a parameter 'msg: str' and returns 'PONG: ' + msg. "
@@ -277,7 +278,9 @@ def test_create_and_validate_skill(sess: HeadlessSession, client_skills: dict):
 
     validated = any("VALIDATION" in l.upper() for l in logs) or (result and "VALIDATION" in result.upper())
     file_exists = os.path.exists(skill_file)
-    report("skill file written to disk", file_exists,
+    report("skill folder created", os.path.isdir(skill_dir),
+           skill_dir if os.path.isdir(skill_dir) else f"NOT FOUND: {skill_dir}")
+    report("skill __init__.py written", file_exists,
            skill_file if file_exists else f"NOT FOUND: {skill_file}")
     report("validation attempted", validated, (result or "no result")[:80])
     if file_exists:
@@ -455,6 +458,86 @@ def test_bounce_recovery(sess: HeadlessSession, client_skills: dict):
 # Real client tool setup
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def test_transaction_manager(sess: HeadlessSession, client_skills: dict):
+    """
+    Multi-skill project test: ask the model to build a minimal transaction
+    manager system consisting of two skills:
+
+      1. txn_ledger  — stores and retrieves an in-memory list of transactions
+                       (add, list, clear operations)
+      2. txn_summary — reads the ledger and returns total / count / average
+
+    Checks:
+      - Both skill folders exist under skills/
+      - Both __init__.py files contain SKILL_FN
+      - txn_ledger(action='add', amount=50, description='groceries') returns ok
+      - txn_summary() returns a numeric total
+      - No workspace staging files remain after completion
+    """
+    print(f"\n{INFO} Test: Transaction manager (multi-skill project)")
+    import os
+
+    skills_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+    ws_root     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+
+    task_id = sess.send_message_with_tools(
+        "Build a minimal transaction manager system as two separate skills:\n"
+        "1. A skill named 'txn_ledger' that manages an in-memory list of transactions. "
+        "It takes action='add'|'list'|'clear', and for 'add' also amount (float) and description (str). "
+        "'add' appends {amount, description} and returns 'added'. "
+        "'list' returns the JSON-serialised list. 'clear' empties it and returns 'cleared'.\n"
+        "2. A skill named 'txn_summary' that reads txn_ledger(action='list') and returns a string: "
+        "'count=N total=X.XX avg=Y.YY'.\n"
+        "Use the two-step pattern (workspace_files then create_skill) for each skill. "
+        "After creating both, call txn_ledger(action='add', amount=42.0, description='test') "
+        "and then txn_summary() and report the results.",
+        client_skills,
+    )
+    if not task_id:
+        report("txn task started", False)
+        return
+
+    result = sess.wait_for_result(task_id)
+
+    # ── Structural checks ─────────────────────────────────────────────────
+    for skill_name in ("txn_ledger", "txn_summary"):
+        skill_dir  = os.path.join(skills_root, skill_name)
+        skill_init = os.path.join(skill_dir, "__init__.py")
+        dir_ok  = os.path.isdir(skill_dir)
+        file_ok = os.path.isfile(skill_init)
+        report(f"{skill_name}: folder created", dir_ok,
+               skill_dir if dir_ok else f"NOT FOUND: {skill_dir}")
+        report(f"{skill_name}: __init__.py written", file_ok,
+               skill_init if file_ok else f"NOT FOUND: {skill_init}")
+        if file_ok:
+            with open(skill_init) as _f:
+                src = _f.read()
+            report(f"{skill_name}: contains SKILL_FN", "SKILL_FN" in src, f"{len(src)} chars")
+
+    # ── Runtime checks — call the skills directly ─────────────────────────
+    # Reload so the test process sees the freshly created skills
+    try:
+        from core.tools import reload_skills, SKILLS
+        reload_skills()
+        if "txn_ledger" in SKILLS and "txn_summary" in SKILLS:
+            ledger_add = str(SKILLS["txn_ledger"](action="add", amount=99.0, description="txn_test"))
+            report("txn_ledger: add returns 'added'", "add" in ledger_add.lower(), ledger_add[:60])
+            summary = str(SKILLS["txn_summary"]())
+            report("txn_summary: returns numeric result",
+                   any(c.isdigit() for c in summary), summary[:80])
+        else:
+            missing = [n for n in ("txn_ledger", "txn_summary") if n not in SKILLS]
+            report("txn skills callable", False, f"not in SKILLS: {missing}")
+    except Exception as e:
+        report("txn runtime call", False, str(e)[:80])
+
+    # ── No staging files left in workspace/ ────────────────────────────────
+    stale = [f for f in os.listdir(ws_root)
+             if f.endswith(".py") and f in ("txn_ledger.py", "txn_summary.py")]
+    report("no staging files left in workspace/", not stale,
+           f"found: {stale}" if stale else "clean")
+
 def _setup_real_tools() -> dict:
     """
     Load the real client-side builtin skill functions so the test can execute
@@ -475,6 +558,8 @@ def _setup_real_tools() -> dict:
         reload_skills()           # also loads any existing user skills
         skills = dict(SKILLS)
         tools_config = list(TOOLS_CONFIG)
+        # Headless override: ask_user would block on stdin — auto-confirm everything.
+        skills["ask_user"] = lambda question="", title="", default="": "yes"
         print(f"  {INFO} Loaded {len(skills)} real client tools: {', '.join(sorted(skills)[:8])}{'…' if len(skills) > 8 else ''}")
         return skills, tools_config
     except Exception as e:
@@ -520,6 +605,7 @@ def main():
             test_create_and_validate_skill(sess, client_skills)
             test_corrupted_context(sess, client_skills, tools_config)
             test_bounce_recovery(sess, client_skills)
+            test_transaction_manager(sess, client_skills)
         except Exception as e:
             traceback.print_exc()
             _results.append(("unexpected error", False, str(e)))

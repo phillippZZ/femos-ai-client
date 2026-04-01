@@ -14,24 +14,37 @@ import os
 import shutil
 import threading
 
-from core.config import WORKSPACE_DIR
+from core.config import WORKSPACE_DIR, SKILLS_DIR
 
 _lock = threading.Lock()
-# Resolve once at import time so the sandbox boundary is stable.
-_WS = os.path.abspath(WORKSPACE_DIR)
+# Resolve once at import time so the sandbox boundaries are stable.
+_WS     = os.path.abspath(WORKSPACE_DIR)
+_SKILLS = os.path.abspath(SKILLS_DIR)
 
 
 def _safe_abs(rel_path: str):
     """
-    Resolve rel_path relative to WORKSPACE_DIR.
-    Returns the absolute path, or None if it would escape the workspace.
+    Resolve rel_path relative to WORKSPACE_DIR (for workspace/ paths) or
+    SKILLS_DIR (for paths starting with 'skills/').
+    Returns (abs_path, display_prefix) or (None, None) if it would escape.
+
+    Paths starting with 'skills/' are sandboxed to SKILLS_DIR.
+    All other paths are sandboxed to WORKSPACE_DIR.
     """
     if not rel_path:
-        return _WS
+        return _WS, "workspace"
+    # Skills root shortcut: 'skills/<name>/...' → resolved relative to SKILLS_DIR parent
+    if rel_path.startswith("skills/") or rel_path == "skills":
+        # Strip the 'skills/' prefix; rest is relative inside SKILLS_DIR
+        inner = rel_path[len("skills/"):] if rel_path.startswith("skills/") else ""
+        abs_path = os.path.normpath(os.path.join(_SKILLS, inner)) if inner else _SKILLS
+        if abs_path != _SKILLS and not abs_path.startswith(_SKILLS + os.sep):
+            return None, None
+        return abs_path, "skills"
     abs_path = os.path.normpath(os.path.join(_WS, rel_path))
     if abs_path != _WS and not abs_path.startswith(_WS + os.sep):
-        return None
-    return abs_path
+        return None, None
+    return abs_path, "workspace"
 
 
 def workspace_files(action: str, path: str = "", content: str = "", dest: str = "") -> str:
@@ -51,14 +64,14 @@ def workspace_files(action: str, path: str = "", content: str = "", dest: str = 
       workspace_files("delete", "finance_tracker/old_reports")
       workspace_files("move", "finance_tracker/v1", dest="finance_tracker/archive/v1")
     """
-    abs_path = _safe_abs(path)
+    abs_path, root_label = _safe_abs(path)
     if abs_path is None:
-        return "Error: path traversal outside workspace is not allowed."
+        return "Error: path must be inside workspace/ or skills/ — traversal is not allowed."
 
     # ── list ──────────────────────────────────────────────────────────
     if action == "list":
         if not os.path.exists(abs_path):
-            return f"Error: '{path or '.'}' does not exist in workspace."
+            return f"Error: '{path or '.'}' does not exist."
         if os.path.isfile(abs_path):
             size = os.path.getsize(abs_path)
             return f"[file] {path}  ({size:,} B)"
@@ -71,7 +84,7 @@ def workspace_files(action: str, path: str = "", content: str = "", dest: str = 
                 size = os.path.getsize(full)
                 entries.append(f"[file] {entry}  ({size:,} B)")
         rel = path or "."
-        header = f"workspace/{rel}/\n"
+        header = f"{root_label}/{rel}/\n" if rel != "." else f"{root_label}/\n"
         return header + ("\n".join(entries) if entries else "  (empty)")
 
     # ── read ──────────────────────────────────────────────────────────
@@ -79,7 +92,7 @@ def workspace_files(action: str, path: str = "", content: str = "", dest: str = 
         if not path:
             return "Error: path is required for read."
         if not os.path.isfile(abs_path):
-            return f"Error: '{path}' is not a file (or does not exist)."
+            return f"Error: '{path}' is not a file (or does not exist in {root_label}/)."    
         try:
             with open(abs_path, "r", errors="replace") as f:
                 data = f.read()
@@ -102,7 +115,7 @@ def workspace_files(action: str, path: str = "", content: str = "", dest: str = 
             try:
                 with open(abs_path, "w") as f:
                     f.write(content)
-                return f"Written {len(content):,} chars to workspace/{path}."
+                return f"Written {len(content):,} chars to {root_label}/{path}."
             except Exception as e:
                 return f"Error writing '{path}': {e}"
 
@@ -116,10 +129,10 @@ def workspace_files(action: str, path: str = "", content: str = "", dest: str = 
             try:
                 if os.path.isdir(abs_path):
                     shutil.rmtree(abs_path)
-                    return f"Deleted directory workspace/{path} (and all its contents)."
+                    return f"Deleted directory {root_label}/{path} (and all its contents)."
                 else:
                     os.remove(abs_path)
-                    return f"Deleted workspace/{path}."
+                    return f"Deleted {root_label}/{path}."
             except Exception as e:
                 return f"Error deleting '{path}': {e}"
 
@@ -127,18 +140,18 @@ def workspace_files(action: str, path: str = "", content: str = "", dest: str = 
     elif action == "move":
         if not path or not dest:
             return "Error: both path and dest are required for move."
-        abs_dest = _safe_abs(dest)
+        abs_dest, dest_label = _safe_abs(dest)
         if abs_dest is None:
-            return "Error: dest path traversal outside workspace is not allowed."
+            return "Error: dest path must be inside workspace/ or skills/ — traversal not allowed."
         if not os.path.exists(abs_path):
-            return f"Error: '{path}' does not exist in workspace."
+            return f"Error: '{path}' does not exist in {root_label}/."
         with _lock:
             parent = os.path.dirname(abs_dest)
-            if parent and parent != _WS:
+            if parent and parent not in (_WS, _SKILLS):
                 os.makedirs(parent, exist_ok=True)
             try:
                 shutil.move(abs_path, abs_dest)
-                return f"Moved workspace/{path} → workspace/{dest}."
+                return f"Moved {root_label}/{path} → {dest_label}/{dest}."
             except Exception as e:
                 return f"Error moving '{path}' to '{dest}': {e}"
 
@@ -152,10 +165,12 @@ SKILL_DEF = {
     "function": {
         "name": "workspace_files",
         "description": (
-            "Manage files and directories within the agent workspace (workspace/). "
-            "Use for data files that skills create — databases, CSVs, JSON configs, reports, etc. "
-            "All paths are relative to the workspace root and cannot escape it. "
-            "Do NOT use for workspace/tasks/ (use task_* tools) or workspace/indexes/ (use rag_*)."
+            "Manage files within the agent workspace (workspace/) or skill source tree (skills/). "
+            "Use workspace/ for runtime data files skills produce — databases, CSVs, JSON configs, reports. "
+            "Use skills/<name>/__init__.py to WRITE skill source code directly before calling create_skill. "
+            "Do NOT use for workspace/tasks/ (use task_* tools) or workspace/indexes/ (use rag_*). "
+            "Paths starting with 'skills/' resolve inside the skills directory. "
+            "All other paths resolve inside workspace/."
         ),
         "parameters": {
             "type": "object",
@@ -168,14 +183,16 @@ SKILL_DEF = {
                         "read — file contents (text, truncated at 8000 chars); "
                         "write — write/overwrite a text file; "
                         "delete — delete a file or entire directory tree; "
-                        "move — rename or relocate within workspace."
+                        "move — rename or relocate (can cross workspace↔skills)."
                     ),
                 },
                 "path": {
                     "type": "string",
                     "description": (
-                        "Path relative to workspace root, e.g. 'finance_tracker/transactions.db'. "
-                        "Leave empty with action='list' to list the workspace root."
+                        "Path relative to workspace root (e.g. 'reports/summary.csv') "
+                        "OR relative to skills root using 'skills/' prefix "
+                        "(e.g. 'skills/txn_ledger/__init__.py'). "
+                        "Leave empty with action='list' to list workspace root."
                     ),
                 },
                 "content": {
@@ -185,7 +202,7 @@ SKILL_DEF = {
                 "dest": {
                     "type": "string",
                     "description": (
-                        "Destination path relative to workspace root. "
+                        "Destination path (same prefix rules as path). "
                         "Used only with action='move'."
                     ),
                 },
