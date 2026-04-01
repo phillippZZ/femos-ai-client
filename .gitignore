@@ -10,6 +10,11 @@
 !/skills/skill_reader.py
 .DS_Store
 
-# 3. Ignore generated workspace content but keep directory structure
-/workspace/tasks/*/
-/workspace/indexes/*/
+# 3. Ignore all workspace content but keep directory structure
+/workspace/*
+!/workspace/tasks/
+!/workspace/indexes/
+/workspace/tasks/*
+!/workspace/tasks/.gitkeep
+/workspace/indexes/*
+!/workspace/indexes/.gitkeep

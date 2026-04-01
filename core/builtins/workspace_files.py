@@ -33,6 +33,14 @@ def _safe_abs(rel_path: str):
     """
     if not rel_path:
         return _WS, "workspace"
+    # Silently strip a leading "workspace/" prefix — paths are already relative to
+    # WORKSPACE_DIR, so "workspace/foo.json" and "foo.json" should be identical.
+    if rel_path == "workspace":
+        return _WS, "workspace"
+    if rel_path.startswith("workspace/"):
+        rel_path = rel_path[len("workspace/"):]
+        if not rel_path:
+            return _WS, "workspace"
     # Skills root shortcut: 'skills/<name>/...' → resolved relative to SKILLS_DIR parent
     if rel_path.startswith("skills/") or rel_path == "skills":
         # Strip the 'skills/' prefix; rest is relative inside SKILLS_DIR
@@ -64,6 +72,19 @@ def workspace_files(action: str, path: str = "", content: str = "", dest: str = 
       workspace_files("delete", "finance_tracker/old_reports")
       workspace_files("move", "finance_tracker/v1", dest="finance_tracker/archive/v1")
     """
+    # Normalize path so display messages don't echo redundant prefixes.
+    # workspace_files paths are relative to workspace/ or skills/ root already.
+    if path == "workspace":
+        path = ""
+    elif path.startswith("workspace/"):
+        path = path[len("workspace/"):]
+    # skills/ prefix: keep for routing in _safe_abs, but strip for display only
+    # by letting _safe_abs handle it — we just need to not double it in output.
+    # (path is passed as-is; root_label will be 'skills' and path will already
+    #  start with 'skills/' → display would be 'skills/skills/...'. Strip here.)
+    _display_path = path
+    if _display_path.startswith("skills/"):
+        _display_path = _display_path[len("skills/"):]
     abs_path, root_label = _safe_abs(path)
     if abs_path is None:
         return "Error: path must be inside workspace/ or skills/ — traversal is not allowed."
@@ -108,6 +129,45 @@ def workspace_files(action: str, path: str = "", content: str = "", dest: str = 
             return "Error: path is required for write."
         if os.path.isdir(abs_path):
             return f"Error: '{path}' is a directory — provide a file path."
+
+        # Validate Python files written into the skills/ tree before touching disk.
+        # JSON literals (null/true/false) are auto-corrected to Python equivalents
+        # rather than rejected — the model consistently uses JSON syntax for default args.
+        _autofix_note = ""
+        if root_label == "skills" and path.endswith(".py"):
+            import re as _re, py_compile as _pyc, tempfile as _tmp
+            _json_tokens = _re.findall(
+                r'(?<![\w\'\"#])\b(null|true|false)\b(?![\w\'\"#])', content
+            )
+            if _json_tokens:
+                _jmap = {'null': 'None', 'true': 'True', 'false': 'False'}
+                content = _re.sub(
+                    r'(?<![\w\'\"#])\b(null|true|false)\b(?![\w\'\"#])',
+                    lambda m: _jmap[m.group(0)], content
+                )
+                _bad = list(dict.fromkeys(_json_tokens))
+                _autofix_note = " (auto-corrected: " + ", ".join(f"{t}\u2192{_jmap[t]}" for t in _bad) + ")"
+            _tmp_path = None
+            try:
+                with _tmp.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as _f:
+                    _f.write(content)
+                    _tmp_path = _f.name
+                _pyc.compile(_tmp_path, doraise=True)
+            except _pyc.PyCompileError as _e:
+                err_str = str(_e)
+                lm = _re.search(r'line (\d+)', err_str)
+                if lm:
+                    lineno = int(lm.group(1))
+                    lines = content.splitlines()
+                    if 1 <= lineno <= len(lines):
+                        bad_line = lines[lineno - 1].strip()
+                        return (f"Write rejected: syntax error at line {lineno}: {bad_line!r}. "
+                                f"Fix the code and call workspace_files again.")
+                return f"Write rejected: syntax error in Python code: {err_str}"
+            finally:
+                if _tmp_path and os.path.exists(_tmp_path):
+                    os.remove(_tmp_path)
+
         with _lock:
             parent = os.path.dirname(abs_path)
             if parent:
@@ -115,7 +175,7 @@ def workspace_files(action: str, path: str = "", content: str = "", dest: str = 
             try:
                 with open(abs_path, "w") as f:
                     f.write(content)
-                return f"Written {len(content):,} chars to {root_label}/{path}."
+                return f"Written {len(content):,} chars to {root_label}/{_display_path}.{_autofix_note}"
             except Exception as e:
                 return f"Error writing '{path}': {e}"
 

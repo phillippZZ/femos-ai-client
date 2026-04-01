@@ -82,6 +82,22 @@ def validate_skill(name: str, test_args: dict = None,
             f"Result: {result_str[:500]}"
         )
 
+    # Detect stub/placeholder implementations — these are NOT acceptable final states.
+    _stub_phrases = (
+        "not implemented", "notimplemented",
+        "todo", "to do", "to-do",
+        "placeholder", "stub",
+        "pass",               # bare Python pass — function returns None and str(None)="None"
+        "coming soon", "not yet implemented",
+    )
+    result_lower = result_str.strip().lower()
+    if any(result_lower == p or result_lower.startswith(p) for p in _stub_phrases):
+        return (
+            f"VALIDATION FAIL: skill '{name}' is a stub — it returned {result_str!r}.\n"
+            f"The skeleton is not the final implementation. "
+            f"Replace the placeholder body with real logic, then validate again."
+        )
+
     # Optional content check
     if expected_contains:
         if expected_contains.lower() not in result_str.lower():
@@ -103,8 +119,11 @@ SKILL_DEF = {
         "description": (
             "Run a skill with test arguments to verify it works correctly. "
             "ALWAYS call this after create_skill as the VALIDATE step. "
-            "If validation fails, diagnose and fix using create_skill(overwrite=true), "
-            "then validate again. Mark the task complete only after VALIDATION PASS."
+            "Returns VALIDATION PASS only when the skill runs without error AND "
+            "returns a real (non-stub) result — stubs returning 'not implemented', "
+            "'TODO', 'placeholder', etc. are automatically reported as VALIDATION FAIL. "
+            "If validation fails, rewrite the skill body with create_skill(overwrite=true) "
+            "and validate again. Mark the task complete only after VALIDATION PASS."
         ),
         "parameters": {
             "type": "object",

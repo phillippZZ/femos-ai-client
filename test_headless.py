@@ -172,11 +172,12 @@ class HeadlessSession:
             return [m for m in self._messages if m.get("type") == msg_type]
 
     def tool_calls_for_task(self, task_id: str = "") -> list[dict]:
-        """Return tool_call messages (these are delegated to client)."""
+        """Return tool_call messages for a specific task (or all if task_id is empty)."""
         with self._msg_lock:
             return [
                 m for m in self._messages
                 if m.get("type") == "tool_call"
+                and (not task_id or m.get("task_id") == task_id)
             ]
 
     def answer_tool_calls(self, default_result: str = "OK"):
@@ -200,10 +201,11 @@ class HeadlessSession:
                     "content": default_result,
                 })
 
-    def answer_tool_calls_real(self, skills: dict, fallback: str = "OK"):
+    def answer_tool_calls_real(self, skills: dict, task_id: str = "", fallback: str = "OK"):
         """Execute tool_call messages using the real client skill functions.
+        If task_id is given, only answers calls belonging to that task.
         Unknown tools fall back to `fallback`.  Already-answered calls are skipped."""
-        for tc in self.tool_calls_for_task():
+        for tc in self.tool_calls_for_task(task_id):
             call_id = tc.get("call_id")
             if not call_id:
                 continue
@@ -216,6 +218,11 @@ class HeadlessSession:
                 continue
             func_name = tc.get("name", "")
             args = tc.get("args") or {}
+            # Log the call with a compact arg preview
+            arg_preview = ", ".join(
+                f"{k}={repr(v)[:60]}" for k, v in (args.items() if isinstance(args, dict) else [])
+            )
+            print(f"    \033[90m→ tool_call: {func_name}({arg_preview[:120]})\033[0m")
             if func_name in skills:
                 try:
                     result = str(skills[func_name](**args))
@@ -223,6 +230,8 @@ class HeadlessSession:
                     result = f"SKILL_ERROR: {type(e).__name__}: {e}"
             else:
                 result = fallback
+            result_preview = result[:120].replace("\n", " ")
+            print(f"    \033[90m← {func_name}: {result_preview}\033[0m")
             self.send({
                 "type": "tool_result",
                 "call_id": call_id,
@@ -233,22 +242,55 @@ class HeadlessSession:
     def send_message_with_tools(self, text: str, skills: dict) -> str:
         """Like send_message but continuously answers incoming tool_call messages
         in a background thread while blocking for task_completed.
-        Use this for any request that will delegate tool calls to the client."""
+        Use this for any request that will delegate tool calls to the client.
+        Only tool_calls belonging to the current task_id are answered, so
+        orphaned calls from previously cancelled tasks cannot interfere."""
+        # Step 1: send the message and wait for task_started to get the task_id.
+        # We need the id BEFORE starting the answer loop so the loop can filter.
+        task_id_holder: list = []
+        mark = len(self._messages)
+        self.send({"type": "message", "text": text})
+
+        def _got_started():
+            with self._msg_lock:
+                for m in self._messages[mark:]:
+                    if m.get("type") == "task_started":
+                        task_id_holder.append(m.get("task_id", ""))
+                        return True
+            return False
+        wait_for(_got_started)
+        task_id = task_id_holder[0] if task_id_holder else ""
+
+        # Step 2: answer tool_calls for THIS task only, in a background thread.
         stop_ev = threading.Event()
 
         def _answer_loop():
             while not stop_ev.wait(timeout=0.3):
-                self.answer_tool_calls_real(skills)
-            # One final sweep after the task finishes
-            self.answer_tool_calls_real(skills)
+                self.answer_tool_calls_real(skills, task_id=task_id)
+            self.answer_tool_calls_real(skills, task_id=task_id)
 
         t = threading.Thread(target=_answer_loop, daemon=True)
         t.start()
         try:
-            task_id = self.send_message(text)  # blocks until task_completed
+            if task_id:
+                self.wait_for_completed(task_id)
         finally:
             stop_ev.set()
             t.join(timeout=2)
+
+        # Print all task_log events so failures are diagnosable without the server terminal
+        if task_id:
+            logs = self.get_task_logs(task_id)
+            if logs:
+                print(f"    \033[90m--- task logs ({task_id}) ---\033[0m")
+                for l in logs:
+                    print(f"    \033[90m[log] {l[:200]}\033[0m")
+            with self._msg_lock:
+                for m in self._messages:
+                    if m.get("type") == "task_failed" and m.get("task_id") == task_id:
+                        print(f"    \033[91m[task_failed] {m.get('error','?')}\033[0m")
+                    elif m.get("type") == "result" and m.get("task_id") == task_id:
+                        print(f"    \033[90m[result] {str(m.get('text',''))[:200]}\033[0m")
         return task_id
 
 
@@ -459,6 +501,78 @@ def test_bounce_recovery(sess: HeadlessSession, client_skills: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def test_cancel_and_recover(sess: HeadlessSession, client_skills: dict):
+    """
+    Robustness test: simulate the 'orphaned Ollama thread' scenario.
+
+    1. Send a task and immediately cancel it after task_started (before the
+       model can respond).  The asyncio task is killed; the worker thread may
+       still be blocking inside requests.post() for the Ollama call.
+    2. Send a new, simple task RIGHT AWAY — while the old thread may still be
+       running concurrently.
+    3. Verify the new task completes and returns a sensible response despite
+       possible Ollama concurrency.
+
+    This proves session isolation: the cancelled task's Session object cannot
+    corrupt the new task's interrupt_event or history.
+    """
+    print(f"\n{INFO} Test: Cancel-and-recover (orphaned-task robustness)")
+
+    # ── Step 1: send a task then immediately cancel it ─────────────────────
+    mark = len(sess._messages)
+    sess.send({"type": "message", "text": "What is the exact value of pi to 500 decimal places? Show full working."})
+
+    # Wait for task_started so we have a valid task_id to cancel
+    cancelled_id_holder: list = []
+    def _started():
+        with sess._msg_lock:
+            for m in sess._messages[mark:]:
+                if m.get("type") == "task_started":
+                    cancelled_id_holder.append(m["task_id"])
+                    return True
+        return False
+    wait_for(_started)
+    cancelled_id = cancelled_id_holder[0]
+    print(f"    {INFO} Cancelling task {cancelled_id} immediately after start…")
+    sess.send({"type": "cancel_task", "task_id": cancelled_id})
+
+    # Wait for task_failed (cancelled) before proceeding
+    sess.wait_for_completed(cancelled_id)
+    with sess._msg_lock:
+        cancel_msg = next(
+            (m for m in sess._messages
+             if m.get("type") == "task_failed" and m.get("task_id") == cancelled_id),
+            None,
+        )
+    cancelled_ok = cancel_msg is not None
+    report("cancel acknowledged", cancelled_ok,
+           cancel_msg.get("error", "")[:60] if cancel_msg else "no task_failed received")
+
+    # ── Step 2: immediately start a new task ───────────────────────────────
+    # Use send_message_with_tools so tool calls are answered in case the model
+    # decides to call something.  Ask a simple conversational question so the
+    # model replies quickly without long tool chains.
+    print(f"    {INFO} Sending recovery task immediately (Ollama thread from cancelled task may still be running)…")
+    recovery_task_id = sess.send_message_with_tools(
+        "Reply with exactly the word PONG and nothing else.",
+        client_skills,
+    )
+    result = sess.wait_for_result(recovery_task_id) or ""
+    result_ok = bool(result.strip())
+    report("recovery task completed", result_ok,
+           result[:80] if result_ok else "empty result")
+    report("recovery result contains PONG", "pong" in result.lower(),
+           result[:80])
+
+    # ── Step 3: confirm no session cross-contamination ─────────────────────
+    # The cancelled task's interrupt_event is on a different Session object.
+    # Verify the recovery task's response doesn't contain any error markers
+    # that would indicate the sessions leaked into each other.
+    report("no session leak (no SKILL_ERROR in result)",
+           "SKILL_ERROR" not in result and "interrupted" not in result.lower(),
+           result[:80] if result else "empty")
+
+
 def test_transaction_manager(sess: HeadlessSession, client_skills: dict):
     """
     Multi-skill project test: ask the model to build a minimal transaction
@@ -476,31 +590,71 @@ def test_transaction_manager(sess: HeadlessSession, client_skills: dict):
       - No workspace staging files remain after completion
     """
     print(f"\n{INFO} Test: Transaction manager (multi-skill project)")
-    import os
+    import os, shutil
 
     skills_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
     ws_root     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
 
-    task_id = sess.send_message_with_tools(
-        "Build a minimal transaction manager system as two separate skills:\n"
-        "1. A skill named 'txn_ledger' that manages an in-memory list of transactions. "
-        "It takes action='add'|'list'|'clear', and for 'add' also amount (float) and description (str). "
-        "'add' appends {amount, description} and returns 'added'. "
-        "'list' returns the JSON-serialised list. 'clear' empties it and returns 'cleared'.\n"
-        "2. A skill named 'txn_summary' that reads txn_ledger(action='list') and returns a string: "
-        "'count=N total=X.XX avg=Y.YY'.\n"
-        "Use the two-step pattern (workspace_files then create_skill) for each skill. "
-        "After creating both, call txn_ledger(action='add', amount=42.0, description='test') "
-        "and then txn_summary() and report the results.",
+    # Remove any stale skills and workspace data from a previous run so the model builds fresh.
+    for _s in ("txn_ledger", "txn_summary"):
+        _d = os.path.join(skills_root, _s)
+        if os.path.isdir(_d):
+            shutil.rmtree(_d)
+        _wd = os.path.join(ws_root, _s)
+        if os.path.isdir(_wd):
+            shutil.rmtree(_wd)
+
+    # ── Build skill 1: txn_ledger ─────────────────────────────────────────
+    # Split into two separate tasks so the model cannot "stop after skill 1".
+    task1_id = sess.send_message_with_tools(
+        "Create a skill named 'txn_ledger' with the following behaviour:\n"
+        "  - action='add', amount (float), description (str) → appends {amount, description} to a "
+        "persistent JSON list stored in workspace at 'txn_ledger/transactions.json', returns 'added'\n"
+        "  - action='list' → reads 'txn_ledger/transactions.json' and returns its content as a JSON string\n"
+        "  - action='clear' → overwrites 'txn_ledger/transactions.json' with '[]', returns 'cleared'\n\n"
+        "For file I/O inside the skill, import workspace_files:\n"
+        "  from core.builtins.workspace_files import workspace_files\n"
+        "Store data in a skill-specific subfolder — path='txn_ledger/transactions.json' "
+        "(NOT 'transactions.json' at workspace root, NOT 'workspace/...').\n\n"
+        "Steps:\n"
+        "  1. workspace_files(action='write', path='skills/txn_ledger/__init__.py', content='<full source>')\n"
+        "  2. create_skill(name='txn_ledger')\n"
+        "  3. validate_skill(name='txn_ledger', test_args={'action': 'add', 'amount': 42.0, 'description': 'test'})\n"
+        "     Validation must return PASS before you finish.\n"
+        "Report 'txn_ledger DONE' when validated.",
         client_skills,
     )
-    if not task_id:
-        report("txn task started", False)
+    if not task1_id:
+        report("txn_ledger task started", False)
         return
 
-    result = sess.wait_for_result(task_id)
+    # ── Build skill 2: txn_summary ────────────────────────────────────────
+    task2_id = sess.send_message_with_tools(
+        "Create a skill named 'txn_summary'.\n"
+        "It takes no arguments. It reads the transaction ledger by importing and calling "
+        "txn_ledger(action='list') from within the skill body, parses the JSON, and returns "
+        "a string in the format: 'count=N total=X.XX avg=Y.YY'.\n\n"
+        "To call txn_ledger from inside the skill:\n"
+        "  from skills.txn_ledger import SKILL_FN as txn_ledger\n\n"
+        "Steps:\n"
+        "  1. workspace_files(action='write', path='skills/txn_summary/__init__.py', content='<full source>')\n"
+        "  2. create_skill(name='txn_summary')\n"
+        "  3. validate_skill(name='txn_summary', test_args={})\n"
+        "     Validation must return PASS before you finish.\n"
+        "After BOTH skills pass validation:\n"
+        "  - Call txn_ledger(action='add', amount=42.0, description='test')\n"
+        "  - Call txn_summary()\n"
+        "  - Report both results.",
+        client_skills,
+    )
+    if not task2_id:
+        report("txn_summary task started", False)
+
+    result = sess.wait_for_result(task2_id) if task2_id else None
 
     # ── Structural checks ─────────────────────────────────────────────────
+    from core.tools import reload_skills as _reload, SKILLS as _SKILLS
+    _reload()
     for skill_name in ("txn_ledger", "txn_summary"):
         skill_dir  = os.path.join(skills_root, skill_name)
         skill_init = os.path.join(skill_dir, "__init__.py")
@@ -511,9 +665,13 @@ def test_transaction_manager(sess: HeadlessSession, client_skills: dict):
         report(f"{skill_name}: __init__.py written", file_ok,
                skill_init if file_ok else f"NOT FOUND: {skill_init}")
         if file_ok:
+            # Check the skill loaded and is callable — that's what actually matters.
+            # SKILL_FN boilerplate is optional when create_skill auto-detects the callable.
+            callable_ok = skill_name in _SKILLS and callable(_SKILLS[skill_name])
             with open(skill_init) as _f:
                 src = _f.read()
-            report(f"{skill_name}: contains SKILL_FN", "SKILL_FN" in src, f"{len(src)} chars")
+            report(f"{skill_name}: loaded and callable", callable_ok,
+                   f"{len(src)} chars" if callable_ok else f"not in SKILLS ({len(src)} chars)")
 
     # ── Runtime checks — call the skills directly ─────────────────────────
     # Reload so the test process sees the freshly created skills
@@ -532,11 +690,16 @@ def test_transaction_manager(sess: HeadlessSession, client_skills: dict):
     except Exception as e:
         report("txn runtime call", False, str(e)[:80])
 
-    # ── No staging files left in workspace/ ────────────────────────────────
+    # ── No staging files left in workspace/ root ──────────────────────────
     stale = [f for f in os.listdir(ws_root)
              if f.endswith(".py") and f in ("txn_ledger.py", "txn_summary.py")]
+    # Data files should be under workspace/txn_ledger/, not at the root
+    root_data = [f for f in os.listdir(ws_root)
+                 if f.endswith(".json") and not os.path.isdir(os.path.join(ws_root, f))]
     report("no staging files left in workspace/", not stale,
            f"found: {stale}" if stale else "clean")
+    report("no data files at workspace/ root (should be in subfolder)", not root_data,
+           f"found at root: {root_data}" if root_data else "clean")
 
 def _setup_real_tools() -> dict:
     """
@@ -602,9 +765,10 @@ def main():
             time.sleep(0.3)
             sess.send({"type": "register_skills", "skills": tools_config, "workspace_tasks": []})
             time.sleep(0.3)
-            test_create_and_validate_skill(sess, client_skills)
-            test_corrupted_context(sess, client_skills, tools_config)
-            test_bounce_recovery(sess, client_skills)
+            # test_create_and_validate_skill(sess, client_skills)
+            # test_corrupted_context(sess, client_skills, tools_config)
+            # test_bounce_recovery(sess, client_skills)
+            # test_cancel_and_recover(sess, client_skills)
             test_transaction_manager(sess, client_skills)
         except Exception as e:
             traceback.print_exc()

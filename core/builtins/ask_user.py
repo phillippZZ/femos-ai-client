@@ -18,7 +18,7 @@ def ask_user(question: str, title: str = "AI Assistant", default: str = "") -> s
     print(f"  {question}", file=sys.stderr)
     if default:
         print(f"  (press Enter to accept default: {default!r})", file=sys.stderr)
-    width = max(len(title) + 8, 20)1
+    width = max(len(title) + 8, 20)
     print(f"╚{'═' * width}╝", file=sys.stderr)
     try:
         response = input("→ ").strip()

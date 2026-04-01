@@ -36,45 +36,61 @@ def create_skill(name, code="", code_file="", overwrite=False, docs="", notes=""
     if isinstance(overwrite, str):
         overwrite = overwrite.lower() in ("true", "1", "yes")
 
-    # Resolve code from code_file if given (sandboxed to workspace/ or skills/<name>/)
+    # Resolve code from code_file if given (sandboxed to workspace/ or skills/)
     _staging_path = None  # workspace staging file to delete on success (workspace/ only)
     if code_file:
         _ws = os.path.abspath(WORKSPACE_DIR)
-        # Allow code_file relative to workspace/ or absolute path within skills/
-        abs_path = os.path.abspath(os.path.join(_ws, code_file))
-        if not abs_path.startswith(_ws + os.sep) and abs_path != _ws:
-            return "Error: code_file path traversal is not allowed."
-        if not os.path.isfile(abs_path):
-            return f"Error: code_file '{code_file}' not found in workspace."
+        _sk = os.path.abspath(SKILLS_DIR)
+        _client_root = os.path.dirname(_ws)  # parent of workspace/ = client root
+        # Try workspace/ first, then client root (covers skills/<name>/__init__.py paths)
+        _candidates = [
+            os.path.abspath(os.path.join(_ws, code_file)),
+            os.path.abspath(os.path.join(_client_root, code_file)),
+        ]
+        abs_path = None
+        for _candidate in _candidates:
+            allowed = _candidate.startswith(_ws + os.sep) or _candidate.startswith(_sk + os.sep)
+            if allowed and os.path.isfile(_candidate):
+                abs_path = _candidate
+                break
+        if abs_path is None:
+            return f"Error: code_file '{code_file}' not found in workspace/ or skills/."
         with open(abs_path) as _f:
             code = _f.read()  # code_file always wins — overrides any inline code
         # Only track for cleanup if the file is inside workspace/ (not skills/)
-        _sk = os.path.abspath(SKILLS_DIR)
         if not abs_path.startswith(_sk + os.sep):
             _staging_path = abs_path
 
     if not code:
         # No inline code and no code_file — check if __init__.py already exists
-        # (model wrote directly to skills/<name>/__init__.py via workspace_files)
+        # (model wrote directly to skills/<name>/__init__.py via workspace_files).
+        # In this case the file write is the explicit confirmation — auto-overwrite.
         _existing = os.path.join(os.path.abspath(SKILLS_DIR), name, "__init__.py")
         if os.path.isfile(_existing):
             with open(_existing) as _f:
                 code = _f.read()
+            # If caller didn't explicitly ask to overwrite, set it automatically:
+            # the workspace_files write already confirmed intent.
+            overwrite = True
         else:
             return "Error: provide 'code' (Python source), 'code_file' (path in workspace/), or write the code to skills/<name>/__init__.py first."
 
     if not name.isidentifier():
         return f"Error: '{name}' is not a valid Python module name."
 
-    # Check for common JSON-ism mistakes that pass py_compile but fail at import
+    # Auto-correct JSON literals to Python equivalents.
+    # The model consistently uses null/true/false for default parameter values.
     import re as _re
     _json_tokens = _re.findall(r'(?<![\w\'"#])\b(null|true|false)\b(?![\w\'"#])', code)
+    _json_autofix = ""
     if _json_tokens:
-        bad = list(dict.fromkeys(_json_tokens))  # deduplicate, preserve order
-        mapping = {'null': 'None', 'true': 'True', 'false': 'False'}
-        fixes = ', '.join(f'{t!r} → {mapping[t]!r}' for t in bad)
-        return (f"Syntax error: code contains JSON literals that are not valid Python: {fixes}. "
-                f"Replace them with their Python equivalents before calling create_skill again.")
+        _jmap = {'null': 'None', 'true': 'True', 'false': 'False'}
+        code = _re.sub(
+            r'(?<![\w\'"#])\b(null|true|false)\b(?![\w\'"#])',
+            lambda m: _jmap[m.group(0)], code
+        )
+        _bad = list(dict.fromkeys(_json_tokens))
+        _json_autofix = " (auto-corrected: " + ", ".join(f"{t}\u2192{_jmap[t]}" for t in _bad) + ")"
 
     tmp_path = None
     try:
@@ -172,11 +188,11 @@ def create_skill(name, code="", code_file="", overwrite=False, docs="", notes=""
             if registered:
                 names_str = ", ".join(f"'{n}'" for n in registered)
                 return (
-                    f"Skill '{name}' created at skills/{name}/ and loaded successfully. "
+                    f"Skill '{name}' created at skills/{name}/ and loaded successfully.{_json_autofix} "
                     f"Registered callable name(s): {names_str}. "
                     f"Use these exact names when calling the skill."
                 )
-            return f"Skill '{name}' created at skills/{name}/ and loaded successfully."
+            return f"Skill '{name}' created at skills/{name}/ and loaded successfully.{_json_autofix}"
         except Exception as e:
             if os.path.isdir(skill_dir) and not exists_folder:
                 shutil.rmtree(skill_dir, ignore_errors=True)
@@ -220,11 +236,18 @@ _CREATE_SKILL_DEF = {
         "description": (
             "Write a new reusable Python skill file and hot-reload it into the agent. "
             "Use when the same type of task will recur and deserves a dedicated skill. "
-            "Provide either 'code' (full Python source string) OR 'code_file' (path relative to workspace/ "
-            "where the code was previously written with workspace_files). "
-            "For long skills, prefer the two-step pattern: write code to workspace/ first, then pass code_file here. "
+            "For long skills, use the TWO-STEP PATTERN: "
+            "(1) workspace_files(action='write', path='skills/<name>/__init__.py', content='<full source>'), "
+            "(2) create_skill(name='<name>') — reads the file you just wrote, no code argument needed. "
+            "For short skills (under ~50 lines), pass 'code' inline. "
             "The code must define SKILL_FN and SKILL_DEF at module level. "
-            "If a previous attempt failed due to a bug, set overwrite=true to replace it."
+            "If a previous attempt failed due to a bug, set overwrite=true to replace it. "
+            "FILE PERSISTENCE IN SKILLS: if the skill needs to read/write files, use plain Python "
+            "open()/json — do NOT call workspace_files() without importing it. "
+            "Import it with: from core.builtins.workspace_files import workspace_files "
+            "Each skill must store its data in its own named subfolder under workspace/ "
+            "(e.g. path='txn_ledger/transactions.json', NOT 'transactions.json'). "
+            "Paths passed to workspace_files must be relative to workspace/ root — do NOT include a 'workspace/' prefix."
         ),
         "parameters": {
             "type": "object",
@@ -244,9 +267,10 @@ _CREATE_SKILL_DEF = {
                 "code_file": {
                     "type": "string",
                     "description": (
-                        "Path relative to workspace/ where the skill code was already saved "
-                        "(e.g. 'transaction_manager.py'). Use this instead of 'code' when the "
-                        "source is long — write it with workspace_files first, then pass the path here."
+                        "Path to a file containing the skill source, relative to workspace/ or the client root. "
+                        "NOTE: for the two-step pattern (workspace_files write → create_skill), do NOT pass "
+                        "code_file at all — just call create_skill(name='...') with no other args and it will "
+                        "auto-detect skills/<name>/__init__.py automatically."
                     )
                 },
                 "overwrite": {
